@@ -1,31 +1,31 @@
 # gl-inet-v4.9.0-mac-address-cronjob-regex-bug-disconnecting-internet-every-30-minutes
 GL-Inet GL-MT6000 "Flint 2" router firmware v4.9.0 cronjob bug - internet disconnects every 30 minutes regardless of settings, when Auto Update MAC is set to 'By time'.
-## TL;DR
 
-The "Auto update MAC by time" feature stores its rotation period inside the
-`mac_mode` uci option (for example `r4320` = random MAC, rotate every 4320
-minutes = 3 days). The script that enforces the schedule extracts the period
-with a greedy regex that captures only the **last digit** of the number:
+## TL;DR
+The "Auto update MAC by time" feature saves how often the MAC should change
+inside the `mac_mode` uci option (for example `r4320` = random MAC, change it
+every 4320 minutes = 3 days). The script that does the changing reads that
+number back with a greedy regex, which only ever grabs the **last digit**:
 
 ```sh
 period=$(echo "$mode" | sed 's/.*\([0-9]\+\).*/\1/')   # "r4320" -> "0"
 ```
 
-Every UI preset (1 day = 1440, 3 days = 4320, 7 days = 10080 minutes) ends in a
-zero, so the period always collapses to 0 minutes. The next-rotation timestamp
-is therefore always in the past, and the cron job that is supposed to just
-*check* the schedule every 30 minutes instead rotates the WAN MAC and reloads
-the network on every single tick. Result: a WAN bounce and a new DHCP lease
-every half hour, for everyone using the feature.
+Every preset you can pick in the UI (1 day = 1440, 3 days = 4320, 7 days =
+10080 minutes) ends in a zero, so the schedule always becomes "every 0
+minutes". A cron job wakes up every 30 minutes just to check whether a MAC
+change is due, and with a 0-minute schedule the answer is always yes. So it
+changes the WAN MAC and reloads the network on every single tick: a short
+internet drop and a new public IP every half hour, for everyone who has the
+feature on.
 
-One-character-class fix:
+The actual fix is one character class:
 
 ```sh
 period=$(echo "$mode" | sed 's/[^0-9]*\([0-9]\+\).*/\1/')   # "r4320" -> "4320"
 ```
 
 Quick fix:
-
 
 ```sh
 # Backup the file
@@ -70,21 +70,23 @@ Thu Jul 23 20:30:07 netifd: wan (6825): udhcpc: lease of 198.51.100.42 obtained,
 Thu Jul 23 20:30:07 netifd: Interface 'wan' is now up
 ```
 
-Four observations rule out a line or ISP fault and point at software on the
-router:
+Four things in this log rule out a bad line or the ISP, and point straight at
+software on the router:
 
-1. **Clock-exact timing.** Drops at hh:00:01 and hh:30:01. Physical faults are
-   never this punctual; cron fires at second :00 and a script takes about a
-   second to act.
-2. **`udhcpc: received SIGTERM` + DHCP release.** The DHCP client was told to
-   shut down and release the lease. That is an administrative teardown, and
-   the release is why a new public IP arrived after every drop.
-3. **`Interface 'wan' is disabled` then `enabled`.** A pure cable/link loss
-   never disables the interface. This is the signature of an `ifup`-style
-   restart from software.
+1. **The timing is too perfect.** Drops at hh:00:01 and hh:30:01, every time.
+   Broken cables and flaky ISPs are never this punctual. Cron jobs are: cron
+   fires at second :00 and the script needs about a second to act.
+2. **`udhcpc: received SIGTERM` + DHCP release.** The DHCP client didn't
+   crash or time out, it was told to shut down and give the IP back.
+   Something did this on purpose, and handing the lease back is why a new
+   public IP arrived after every drop.
+3. **`Interface 'wan' is disabled` then `enabled`.** Pulling a cable never
+   *disables* the interface. Only software restarting the interface looks
+   like this.
 4. **The PHY is re-probed.** The `PHY [mdio-bus:01] driver [RTL8221B-VB-CG]`
-   line means eth1 was closed and reopened by software. The ~3 s gap to
-   `Link is Up` is just autonegotiation, then DHCP takes another ~3 s.
+   line means the ethernet port was closed and reopened by software. The
+   ~3 s until `Link is Up` is the two ends renegotiating the link, then DHCP
+   needs another ~3 s. That's the whole outage.
 
 ### 2. Finding the trigger
 
@@ -203,24 +205,20 @@ root@GL-MT6000:~# logread | grep -iE "wan|eth1" | tail -5
 # (no new link-down events)
 ```
 
-Before the fix, every invocation rotated the MAC. After the fix, the script
-only rotates when the configured cycle has actually elapsed, and the half-hour
-drops are gone.
+Before the fix, every run changed the MAC. After the fix, the script only
+acts when the configured cycle has really passed, and the half-hour drops are
+gone.
 
 ## Workarounds and caveats
 
-- If you do not need periodic MAC rotation, simply disable "Auto update MAC"
-  in `/netport`. That removes `mac_expire`, and the script then exits without
-  touching anything even though the cron entry remains (it is a harmless
-  checker).
-- The patch modifies a file owned by the `gl-sdk4-cable` package, so a
-  firmware upgrade or package reinstall restores the buggy version. Re-apply
-  until GL.iNet ships a fix.
-- Rotations are gated on NTP: the script does nothing until
-  `/var/state/ntp-valid` exists.
-- If the feature was enabled before patching, the stored `mac_expire` is stale
-  (in the past), so the first cron tick after patching performs one final
-  rotation and then settles into the configured cadence.
+- If you don't care about MAC rotation at all, just switch the feature off in the web UI. The cron line stays,
+  but the script wakes up, sees "feature off", and quits without doing anything.
+- The fix is not permanent: a firmware upgrade overwrites your patched file with the original buggy one.
+  After every firmware update you must run the sed command again, until GL.iNet fixes it in their firmware.
+- The script refuses to rotate until the router has synced its clock over the internet (NTP).
+  Right after boot, before time sync, it does nothing.
+- One-time thing: because the bug kept setting "next rotation" to "right now", the first tick after patching
+  still sees an overdue rotation and does one last MAC change (one short drop), and only then schedules properly.
 
 ## Lessons learned
 
