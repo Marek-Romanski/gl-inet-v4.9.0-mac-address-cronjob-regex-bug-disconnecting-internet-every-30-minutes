@@ -1,0 +1,29 @@
+Fix MAC rotation period parsing in gl-update-cable-mac.sh (gl-sdk4-cable)
+
+The greedy leading .* makes the capture group match only the last digit of
+the rotation period embedded in mac_mode (e.g. "r4320" -> "0"), so every
+configured cycle collapses to 0 minutes and the WAN MAC is rotated on every
+30-minute cron tick, bouncing the WAN interface each time.
+
+Affected: gl-sdk4-cable git-2026.110.34195-928522b-1 (firmware v4.9.0).
+
+--- a/usr/sbin/gl-update-cable-mac.sh
++++ b/usr/sbin/gl-update-cable-mac.sh
+@@ -41,7 +41,7 @@
+         fi
+ 
+         local period
+-        period=$(echo "$mode" | sed 's/.*\([0-9]\+\).*/\1/')
++        period=$(echo "$mode" | sed 's/[^0-9]*\([0-9]\+\).*/\1/')
+         local new_expire=$((now + period * 60))
+         uci set "network.$device.mac_expire=$new_expire"
+     else
+@@ -81,7 +81,7 @@
+                 now=$(date +%s)
+ 
+                 if [ "$now" -ge "$expire" ]; then
+-                    period=$(echo "$mode" | sed 's/.*\([0-9]\+\).*/\1/')
++                    period=$(echo "$mode" | sed 's/[^0-9]*\([0-9]\+\).*/\1/')
+                     new_expire=$((now + period * 60))
+                     uci set "network.wan.mac_expire=$new_expire"
+ 
